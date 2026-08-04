@@ -17,7 +17,7 @@ STATE_FILE = os.path.join(STATE_DIR, "sdrplay_recovery_state.json")
 SDR_VENDOR_PRODUCT = "1df7:3020"
 RTL433_PER_SDR = 2
 DEFAULT_HEALTH_CHECK_SLEEP = 10.0
-DEFAULT_SNIFFLE_RESTART_SLEEP = 3.0
+DEFAULT_SNIFFLE_RESTART_SLEEP = 8.0
 DEFAULT_SYSTEMCTL_STOP_TIMEOUT = 90
 DEFAULT_SYSTEMCTL_TIMEOUT = 60
 SYSTEMCTL_CFG = {
@@ -453,27 +453,58 @@ def ensure_sniffle_active(
     sniffle_service: str,
     actions: List[str],
     restart_wait: float = DEFAULT_SNIFFLE_RESTART_SLEEP,
+    max_attempts: int = 3,
 ) -> Tuple[bool, str]:
     """
     Ensure sniffle is truly healthy: unit active AND sniff_receiver.py present.
     Restarts when inactive or when only the bridge is left running.
+
+    Retries a few times: sniff_receiver can fail once on /dev/ttyUSB0 (permission
+    or device not ready after USB events) and come up cleanly on a later restart.
     """
     ok_recv, detail = sniffle_receiver_running(sniffle_service)
     if ok_recv:
         return True, detail
 
-    actions.append(f"{sniffle_service} unhealthy ({detail}), restarting")
-    ok, msg = systemctl("restart", sniffle_service)
-    actions.append(msg)
-    if not ok:
-        return False, f"{sniffle_service} restart failed: {msg}"
+    last_detail = detail
+    for attempt in range(1, max_attempts + 1):
+        actions.append(
+            f"{sniffle_service} unhealthy ({last_detail}), restart attempt {attempt}/{max_attempts}"
+        )
+        ok, msg = systemctl("restart", sniffle_service)
+        actions.append(msg)
+        if not ok:
+            last_detail = f"{sniffle_service} restart failed: {msg}"
+            sleep_dbg(2.0, "brief pause after failed systemctl restart")
+            continue
 
-    time.sleep(restart_wait)
-    ok_recv, detail_after = sniffle_receiver_running(sniffle_service)
-    if ok_recv:
-        return True, f"{sniffle_service} healthy after restart: {detail_after}"
+        # Receiver can lag the unit "active" status; wait and re-poll.
+        time.sleep(restart_wait)
+        ok_recv, last_detail = sniffle_receiver_running(sniffle_service)
+        if ok_recv:
+            return True, f"{sniffle_service} healthy after restart attempt {attempt}: {last_detail}"
 
-    return False, f"{sniffle_service} still unhealthy after restart: {detail_after}"
+        extra = max(3.0, float(restart_wait) * 0.5)
+        sleep_dbg(extra, f"sniffle settle after attempt {attempt} (no sniff_receiver yet)")
+        ok_recv, last_detail = sniffle_receiver_running(sniffle_service)
+        if ok_recv:
+            return True, f"{sniffle_service} healthy after settle on attempt {attempt}: {last_detail}"
+
+        if attempt < max_attempts:
+            sleep_dbg(3.0, "pause before next sniffle restart attempt")
+
+    return False, f"{sniffle_service} still unhealthy after {max_attempts} restarts: {last_detail}"
+
+
+def format_side_health(sniffle_ok: Optional[bool], sniffle_detail: str, wifi_ok: Optional[bool]) -> str:
+    parts = []
+    if sniffle_ok is not None:
+        parts.append(f"sniffle={'OK' if sniffle_ok else 'FAILED'}")
+        if sniffle_detail:
+            parts.append(f"({sniffle_detail})")
+    if wifi_ok is not None:
+        parts.append(f"wifi={'OK' if wifi_ok else 'MISSING'}")
+    return " ".join(parts) if parts else ""
 
 
 def ensure_wifi_capture(
@@ -942,20 +973,23 @@ def main():
         "summary": "",
         "state_file": STATE_FILE,
         "powercycle_done": False,
+        "tpms_restarted": False,
+        "wifi_restarted": False,
     }
 
-    # Sniffle is handled independently on every invocation.
+    # ------------------------------------------------------------------
+    # THREE SEPARATE tracks: Sniffle | TPMS (rtl_433/SDR) | WiFi
+    # Only restart a track when that track's health check fails.
+    # ------------------------------------------------------------------
+
+    # --- 1) Bluetooth / Sniffle (own unit; never restarts kismet) ---
     sniffle_ok, sniffle_detail = ensure_sniffle_active(
         args.sniffle_service, result["actions"], args.sniffle_restart_sleep
     )
-    result["actions"].append(f"Startup sniffle check: {sniffle_detail}")
-
-    # WiFi lives under kismet: require kismet_cap_linux_wifi (restart kismet if missing).
-    wifi_ok, wifi_detail = ensure_wifi_capture(
-        args.kismet_service, result["actions"], args.health_check_sleep
-    )
-    result["actions"].append(f"Startup WiFi check: {wifi_detail}")
-    result["wifi_ok"] = bool(wifi_ok)
+    result["sniffle_ok"] = bool(sniffle_ok)
+    result["sniffle_detail"] = sniffle_detail
+    result["actions"].append(f"Sniffle: {sniffle_detail}")
+    print(f"Sniffle: {'OK' if sniffle_ok else 'FAILED'} — {sniffle_detail}", flush=True)
 
     sdr_count = count_sdrplay_devices()
     expect_rtl433 = expected_rtl433_count(sdr_count, args.expect_rtl433)
@@ -968,272 +1002,338 @@ def main():
 
     serial = args.serial.strip() or None
 
-    # Phase 1: always do service restart first, then health-check.
-    dbg("----- PHASE 1: service restart -----")
-    result["actions"].append("Phase 1: Restart services (sdrplay + kismet), then validate rtl_433")
-    ok, msg = systemctl("stop", args.sdrplay_service)
-    dbg(f"stop sdrplay ok={ok}: {msg}")
-    result["actions"].append(msg)
-    ok, msg = systemctl("stop", args.kismet_service)
-    dbg(f"stop kismet ok={ok}: {msg}")
-    result["actions"].append(msg)
-    sleep_dbg(10, "settle after stopping services")
-    ok, msg = systemctl("start", args.sdrplay_service)
-    dbg(f"start sdrplay ok={ok}: {msg}")
-    result["actions"].append(msg)
-    ok, msg = start_kismet(args.kismet_service, result["actions"])
-    dbg(f"start kismet ok={ok}: {msg}")
-    result["actions"].append(msg)
-
-    kismet_ok, rtl_count, health_detail = health_check_kismet(
-        args.kismet_service, expect_rtl433, args.health_check_sleep
+    # --- 2) Observe TPMS (no restart yet) ---
+    dbg("----- TPMS observe (no restart unless unhealthy) -----")
+    kismet_ok, rtl_count, health_detail = get_kismet_state_and_rtl433_count(args.kismet_service)
+    tpms_ok = bool(kismet_ok and rtl_count >= expect_rtl433)
+    result["actions"].append(f"TPMS observe: {health_detail} (expected >= {expect_rtl433})")
+    print(
+        f"TPMS: {'OK' if tpms_ok else 'BAD'} — {health_detail} "
+        f"(need >= {expect_rtl433} rtl_433)",
+        flush=True,
     )
-    dbg(f"Phase 1 health: kismet_ok={kismet_ok} rtl_433={rtl_count}/{expect_rtl433}")
-    result["actions"].append(f"Phase 1 health check: {health_detail}")
-    if not (kismet_ok and rtl_count >= expect_rtl433):
-        diagnose_kismet_failure(args.kismet_service, result["actions"])
-    if kismet_ok and rtl_count >= expect_rtl433:
+
+    # --- 3) Observe WiFi (no restart yet) ---
+    wifi_ok, wifi_detail = wifi_capture_running(args.kismet_service)
+    result["wifi_ok"] = bool(wifi_ok)
+    result["actions"].append(f"WiFi observe: {wifi_detail}")
+    print(f"WiFi: {'OK' if wifi_ok else 'BAD'} — {wifi_detail}", flush=True)
+
+    # --- Fast path: all good → leave kismet/sdrplay alone ---
+    if tpms_ok and wifi_ok:
+        result["ok"] = True
+        result["summary"] = (
+            f"Already healthy: no service restart. kismet active, "
+            f"rtl_433={rtl_count} (expected >= {expect_rtl433}, {sdr_count} SDR(s)); "
+            f"wifi OK; sniffle={'OK' if sniffle_ok else 'FAILED'}"
+        )
+        result["actions"].append("Skip TPMS/WiFi recovery: both already healthy")
+        record_state(result, ok=True, last_action=result["summary"])
+        emit(result, args.json_output)
+        return 0
+
+    # --- 4) TPMS recovery only when broken (Phase 1 service bounce) ---
+    if not tpms_ok:
+        dbg("----- TPMS Phase 1: service restart (only because TPMS unhealthy) -----")
+        result["actions"].append(
+            f"TPMS unhealthy ({health_detail}); restarting sdrplay+kismet"
+        )
+        result["tpms_restarted"] = True
+        ok, msg = systemctl("stop", args.sdrplay_service)
+        dbg(f"stop sdrplay ok={ok}: {msg}")
+        result["actions"].append(msg)
+        ok, msg = systemctl("stop", args.kismet_service)
+        dbg(f"stop kismet ok={ok}: {msg}")
+        result["actions"].append(msg)
+        sleep_dbg(10, "settle after stopping services")
+        ok, msg = systemctl("start", args.sdrplay_service)
+        dbg(f"start sdrplay ok={ok}: {msg}")
+        result["actions"].append(msg)
+        ok, msg = start_kismet(args.kismet_service, result["actions"])
+        dbg(f"start kismet ok={ok}: {msg}")
+        result["actions"].append(msg)
+
+        kismet_ok, rtl_count, health_detail = health_check_kismet(
+            args.kismet_service, expect_rtl433, args.health_check_sleep
+        )
+        tpms_ok = bool(kismet_ok and rtl_count >= expect_rtl433)
+        dbg(f"TPMS after Phase 1: ok={tpms_ok} rtl_433={rtl_count}/{expect_rtl433}")
+        result["actions"].append(f"TPMS after service restart: {health_detail}")
+        if not tpms_ok:
+            diagnose_kismet_failure(args.kismet_service, result["actions"])
+        else:
+            result["actions"].append("TPMS recovered by service restart only")
+            # WiFi may have come back with kismet — re-observe
+            wifi_ok, wifi_detail = wifi_capture_running(args.kismet_service)
+            result["wifi_ok"] = bool(wifi_ok)
+            result["actions"].append(f"WiFi after TPMS restart: {wifi_detail}")
+
+    # --- 5) USB power-cycle only if TPMS still broken ---
+    if not tpms_ok:
+        result["actions"].append(
+            f"TPMS still bad after service restart: rtl_433={rtl_count}/{expect_rtl433}. "
+            "Proceeding to USB reset flow."
+        )
+
+        force_recovery = bool(args.force_recovery or args.skip_rate_limit)
+
+        if not force_recovery:
+            rate_limit_check = check_rate_limit(args.rate_limit_minutes)
+            if rate_limit_check:
+                last_time, minutes_to_wait = rate_limit_check
+                # WiFi-only recovery can still run after this block via fall-through... 
+                # but we return here for rate limit like before.
+                wifi_ok, wifi_detail = wifi_capture_running(args.kismet_service)
+                if not wifi_ok:
+                    wifi_ok, wifi_detail = ensure_wifi_capture(
+                        args.kismet_service, result["actions"], args.health_check_sleep
+                    )
+                    result["wifi_restarted"] = True
+                result["wifi_ok"] = bool(wifi_ok)
+                side = format_side_health(
+                    result.get("sniffle_ok"),
+                    str(result.get("sniffle_detail") or ""),
+                    result.get("wifi_ok"),
+                )
+                result["summary"] = (
+                    f"TPMS not recovered by service restart; USB reset rate limited. "
+                    f"Last power cycle was at {last_time}. Please wait {minutes_to_wait} more minute(s), "
+                    f"or run with --force-recovery."
+                    + (f" Side checks: {side}." if side else "")
+                )
+                result["rate_limited"] = True
+                result["last_cycle_time"] = last_time
+                result["minutes_to_wait"] = minutes_to_wait
+                record_state(result, ok=False, last_action="rate limited")
+                emit(result, args.json_output)
+                return 9
+        else:
+            result["actions"].append("Rate limit bypassed via --force-recovery/--skip-rate-limit")
+
+        if not shutil_which("uhubctl"):
+            result["summary"] = "uhubctl not found"
+            emit(result, args.json_output)
+            return 2
+
+        rc, out, err = run_cmd(privileged_cmd("uhubctl"), timeout=30)
+        if rc != 0:
+            result["summary"] = f"uhubctl failed: {_systemctl_output_text(out, err)}"
+            emit(result, args.json_output)
+            return 3
+
+        dbg("----- TPMS Phase 2: USB power-cycle -----")
+        result["actions"].append("Phase 2: Stop sdrplay and kismet before USB reset")
+        ok, msg = systemctl("stop", args.sdrplay_service)
+        result["actions"].append(msg)
+        ok, msg = systemctl("stop", args.kismet_service)
+        result["actions"].append(msg)
+
+        result["devices_found"] = parse_uhubctl_devices(out)
+        result["actions"].append("Resolving USB reset target(s) per SDR (lsusb + uhubctl/sysfs)")
+        target, target_log = build_reset_targets(out, serial_filter=serial)
+        result["actions"].extend(target_log)
+
+        if serial and not target:
+            result["summary"] = f"Specified serial not found or not targetable: {serial}"
+            record_state(result, ok=False, last_action=result["summary"])
+            emit(result, args.json_output)
+            return 5
+
+        if not target:
+            result["summary"] = "No USB reset target(s) resolved for SDRplay device(s)"
+            record_state(result, ok=False, last_action=result["summary"])
+            emit(result, args.json_output)
+            return 4
+
+        result["devices_targeted"] = target
+        sdr_count = count_sdrplay_devices()
+        expect_rtl433 = expected_rtl433_count(sdr_count, args.expect_rtl433)
+        result["sdr_count"] = sdr_count
+        result["expect_rtl433"] = expect_rtl433
+
+        for d in target:
+            hub = d["hub"]
+            port = d["port"]
+            mode = d.get("mode", "unknown")
+            if mode == "hub_fallback":
+                result["actions"].append(
+                    f"Power-cycling upstream port for downstream hub {d.get('downstream_hub')} "
+                    f"(hub {hub} port {port})"
+                )
+                off_sleep = args.hub_off_sleep
+            else:
+                result["actions"].append(
+                    f"Power-cycling SDRplay port directly (hub {hub} port {port})"
+                )
+                off_sleep = args.off_sleep
+
+            dbg(f"POWER OFF hub {hub} port {port} (mode={mode})")
+            ok, msg = uhubctl_power(hub, port, "off", timeout=20)
+            result["actions"].append(f"hub {hub} port {port} off: {msg}")
+            if not ok:
+                result["summary"] = f"Failed power off hub {hub} port {port}"
+                record_state(result, ok=False, last_action=result["summary"])
+                emit(result, args.json_output)
+                return 6
+
+            sleep_dbg(off_sleep, "port off settle")
+
+            rc_uh, uh_out, uh_err = run_cmd(privileged_cmd("uhubctl"), timeout=30)
+            if rc_uh != 0:
+                result["summary"] = (
+                    f"uhubctl failed before power ON: {uh_err.strip() or uh_out.strip()}"
+                )
+                record_state(result, ok=False, last_action=result["summary"])
+                emit(result, args.json_output)
+                return 7
+
+            t2, match_msg = match_target_for_power_on(d, uh_out)
+            result["actions"].append(f"Power ON target: {match_msg}")
+
+            dbg(f"POWER ON hub {t2['hub']} port {t2['port']}")
+            ok, msg = uhubctl_power(t2["hub"], t2["port"], "on", timeout=20)
+            result["actions"].append(f"hub {t2['hub']} port {t2['port']} on: {msg}")
+            if not ok:
+                result["summary"] = f"Failed power on hub {t2['hub']} port {t2['port']}"
+                record_state(result, ok=False, last_action=result["summary"])
+                emit(result, args.json_output)
+                return 7
+
+            sleep_dbg(args.on_sleep, "port on settle")
+
+        result["powercycle_done"] = True
+
+        dbg("----- POST-RESET: restart services -----")
+        result["actions"].append("Post-reset sequence: sleep 10s before restarting services")
+        sleep_dbg(10, "pre-start settle after USB reset")
+        ok, msg = systemctl("start", args.sdrplay_service)
+        dbg(f"start sdrplay ok={ok}: {msg}")
+        result["actions"].append(msg)
+        sleep_dbg(5, "let sdrplay API come up before kismet")
+        ok, msg = start_kismet(args.kismet_service, result["actions"])
+        dbg(f"start kismet ok={ok}: {msg}")
+        result["actions"].append(msg)
+
+        kismet_ok, rtl_count, health_detail = health_check_kismet(
+            args.kismet_service, expect_rtl433, args.health_check_sleep
+        )
+        tpms_ok = bool(kismet_ok and rtl_count >= expect_rtl433)
+        dbg(f"TPMS after USB reset: ok={tpms_ok} rtl={rtl_count}/{expect_rtl433}")
+        result["actions"].append(f"Post-reset TPMS health: {health_detail}")
+        if not tpms_ok:
+            diagnose_kismet_failure(args.kismet_service, result["actions"])
+            result["summary"] = (
+                f"Reset completed but TPMS health check failed: kismet_ok={kismet_ok}, "
+                f"rtl_433={rtl_count}/{expect_rtl433} ({sdr_count} SDR(s) via lsusb)"
+            )
+            # Still try WiFi track separately below if kismet is up
+            wifi_ok, wifi_detail = wifi_capture_running(args.kismet_service)
+            if not wifi_ok and kismet_ok:
+                wifi_ok, wifi_detail = ensure_wifi_capture(
+                    args.kismet_service, result["actions"], args.health_check_sleep
+                )
+                result["wifi_restarted"] = True
+            result["wifi_ok"] = bool(wifi_ok)
+            record_state(result, ok=False, last_action=result["summary"])
+            emit(result, args.json_output)
+            return 10
+
+        if args.verify:
+            ok, vmsg = soapy_verify()
+            result["actions"].append(vmsg)
+            if not ok:
+                result["summary"] = vmsg
+                record_state(result, ok=False, last_action=vmsg)
+                emit(result, args.json_output)
+                return 8
+
+        wifi_ok, wifi_detail = wifi_capture_running(args.kismet_service)
+        result["wifi_ok"] = bool(wifi_ok)
+        result["actions"].append(f"WiFi after USB reset: {wifi_detail}")
+
+        if any(d.get("mode") == "hub_fallback" for d in target):
+            uniq = sorted({d.get("downstream_hub") for d in target if d.get("downstream_hub")})
+            usb_note = f"Power-cycled upstream port(s) for hub(s) {', '.join(uniq)}"
+        else:
+            first = target[0]
+            usb_note = (
+                f"Power-cycled SDRplay port(s), first hub {first['hub']} port {first['port']}"
+            )
+        # Fall through to WiFi-only fix if still needed, then final summary
+        result["actions"].append(f"TPMS recovered after USB: {usb_note}")
+        result["_usb_note"] = usb_note
+
+    # --- 6) WiFi recovery only when WiFi still broken (may restart kismet alone) ---
+    wifi_ok, wifi_detail = wifi_capture_running(args.kismet_service)
+    if not wifi_ok:
+        dbg("----- WiFi-only recovery (kismet restart if capture missing) -----")
+        result["actions"].append(f"WiFi unhealthy ({wifi_detail}); ensuring capture")
         wifi_ok, wifi_detail = ensure_wifi_capture(
             args.kismet_service, result["actions"], args.health_check_sleep
         )
-        result["actions"].append(f"Phase 1 WiFi check: {wifi_detail}")
+        result["wifi_restarted"] = True
         result["wifi_ok"] = bool(wifi_ok)
-        # kismet may have been bounced for wifi — re-validate rtl_433
-        kismet_ok2, rtl_count2, health2 = get_kismet_state_and_rtl433_count(
-            args.kismet_service
-        )
-        result["actions"].append(
-            f"Phase 1 after WiFi ensure: {health2} (expected >= {expect_rtl433})"
-        )
+        result["actions"].append(f"WiFi after ensure: {wifi_detail}")
+        print(f"WiFi after fix: {'OK' if wifi_ok else 'BAD'} — {wifi_detail}", flush=True)
+
+        # Kismet bounce for WiFi must not silently break TPMS; re-observe only.
+        kismet_ok2, rtl_count2, health2 = get_kismet_state_and_rtl433_count(args.kismet_service)
+        result["actions"].append(f"TPMS re-check after WiFi fix: {health2}")
+        tpms_ok = bool(kismet_ok2 and rtl_count2 >= expect_rtl433)
         rtl_count = rtl_count2 if kismet_ok2 else 0
-        if not (kismet_ok2 and rtl_count >= expect_rtl433):
+        if not tpms_ok:
             result["actions"].append(
-                f"Phase 1 post-wifi rtl_433 regression: {rtl_count}/{expect_rtl433}; "
-                "continuing to USB reset if needed"
+                "TPMS regressed after WiFi-only kismet restart; running TPMS service restart once"
             )
-            # Fall through to phase 2 instead of declaring success.
-            kismet_ok = False
+            result["tpms_restarted"] = True
+            ok, msg = systemctl("stop", args.sdrplay_service)
+            result["actions"].append(msg)
+            ok, msg = systemctl("stop", args.kismet_service)
+            result["actions"].append(msg)
+            sleep_dbg(5, "settle before TPMS recovery after wifi bounce")
+            ok, msg = systemctl("start", args.sdrplay_service)
+            result["actions"].append(msg)
+            ok, msg = start_kismet(args.kismet_service, result["actions"])
+            result["actions"].append(msg)
+            kismet_ok, rtl_count, health_detail = health_check_kismet(
+                args.kismet_service, expect_rtl433, args.health_check_sleep
+            )
+            tpms_ok = bool(kismet_ok and rtl_count >= expect_rtl433)
+            result["actions"].append(f"TPMS after regression recovery: {health_detail}")
+            wifi_ok, wifi_detail = wifi_capture_running(args.kismet_service)
+            result["wifi_ok"] = bool(wifi_ok)
+    else:
+        result["wifi_ok"] = True
+        result["actions"].append(f"WiFi already healthy: {wifi_detail}")
+
+    # --- Final report ---
+    parts = []
+    if result.get("tpms_restarted") or result.get("powercycle_done"):
+        if result.get("powercycle_done"):
+            parts.append(
+                f"TPMS recovered after USB ({result.get('_usb_note', 'reset')}); "
+                f"rtl_433={rtl_count}"
+            )
         else:
-            result["ok"] = True
-            result["summary"] = (
-                f"Recovered by service restart only: {args.kismet_service} active, "
-                f"rtl_433 count={rtl_count} (expected >= {expect_rtl433}, {sdr_count} SDR(s) via lsusb)"
-                f"; wifi={'OK' if wifi_ok else 'MISSING'}"
-            )
-            record_state(result, ok=True, last_action=result["summary"])
-            emit(result, args.json_output)
-            return 0
-
-    if not kismet_ok or rtl_count < expect_rtl433:
-        result["actions"].append(
-            f"Phase 1 failed: kismet_ok={kismet_ok}, rtl_433={rtl_count}/{expect_rtl433}. "
-            "Proceeding to USB reset flow."
-        )
-    
-    # Rate limit applies only to USB power-cycle phase.
-    # if not args.skip_rate_limit:
-    #     rate_limit_check = check_rate_limit(args.rate_limit_minutes)
-    #     if rate_limit_check:
-    #         last_time, minutes_to_wait = rate_limit_check
-    #         result["summary"] = (
-    #             f"Service restart did not recover rtl_433, but USB reset is rate limited. "
-    #             f"Last power cycle was at {last_time}. Please wait {minutes_to_wait} more minute(s)."
-    #         )
-    #         result["rate_limited"] = True
-    #         result["last_cycle_time"] = last_time
-    #         result["minutes_to_wait"] = minutes_to_wait
-    #         record_state(result, ok=False, last_action="rate limited")
-    #         emit(result, args.json_output)
-    #         return 9
-
-    force_recovery = bool(args.force_recovery or args.skip_rate_limit)
-
-    if not force_recovery:
-        rate_limit_check = check_rate_limit(args.rate_limit_minutes)
-        if rate_limit_check:
-            last_time, minutes_to_wait = rate_limit_check
-            result["summary"] = (
-                f"Service restart did not recover rtl_433, but USB reset is rate limited. "
-                f"Last power cycle was at {last_time}. Please wait {minutes_to_wait} more minute(s), "
-                f"or run with --force-recovery."
-            )
-            result["rate_limited"] = True
-            result["last_cycle_time"] = last_time
-            result["minutes_to_wait"] = minutes_to_wait
-            record_state(result, ok=False, last_action="rate limited")
-            emit(result, args.json_output)
-            return 9
+            parts.append(f"TPMS recovered by service restart; rtl_433={rtl_count}")
+    elif tpms_ok:
+        parts.append(f"TPMS already OK (rtl_433={rtl_count}); no TPMS service restart")
     else:
-        result["actions"].append("Rate limit bypassed via --force-recovery/--skip-rate-limit")
+        parts.append(f"TPMS still BAD (rtl_433={rtl_count}/{expect_rtl433})")
 
-    if not shutil_which("uhubctl"):
-        result["summary"] = "uhubctl not found"
-        emit(result, args.json_output)
-        return 2
-
-    rc, out, err = run_cmd(privileged_cmd("uhubctl"), timeout=30)
-    if rc != 0:
-        result["summary"] = f"uhubctl failed: {_systemctl_output_text(out, err)}"
-        emit(result, args.json_output)
-        return 3
-
-    # Phase 2 start: stop recovery-related services before USB reset.
-    # Sniffle is handled separately at startup and is not part of SDR reset flow.
-    dbg("----- PHASE 2: USB power-cycle -----")
-    result["actions"].append("Phase 2: Stop sdrplay and kismet before USB reset")
-    ok, msg = systemctl("stop", args.sdrplay_service)
-    result["actions"].append(msg)
-    ok, msg = systemctl("stop", args.kismet_service)
-    result["actions"].append(msg)
-
-    # Per-SDR targets: direct Pi USB3 port + hub-connected SDR on other port (mixed topology).
-    result["devices_found"] = parse_uhubctl_devices(out)
-    result["actions"].append("Resolving USB reset target(s) per SDR (lsusb + uhubctl/sysfs)")
-    target, target_log = build_reset_targets(out, serial_filter=serial)
-    result["actions"].extend(target_log)
-
-    if serial and not target:
-        result["summary"] = f"Specified serial not found or not targetable: {serial}"
-        record_state(result, ok=False, last_action=result["summary"])
-        emit(result, args.json_output)
-        return 5
-
-    if not target:
-        result["summary"] = "No USB reset target(s) resolved for SDRplay device(s)"
-        record_state(result, ok=False, last_action=result["summary"])
-        emit(result, args.json_output)
-        return 4
-
-    result["devices_targeted"] = target
-    sdr_count = count_sdrplay_devices()
-    expect_rtl433 = expected_rtl433_count(sdr_count, args.expect_rtl433)
-    result["sdr_count"] = sdr_count
-    result["expect_rtl433"] = expect_rtl433
-
-    # Power-cycle target(s)
-    for d in target:
-        hub = d["hub"]
-        port = d["port"]
-        mode = d.get("mode", "unknown")
-        if mode == "hub_fallback":
-            result["actions"].append(f"Power-cycling upstream port for downstream hub {d.get('downstream_hub')} (hub {hub} port {port})")
-            off_sleep = args.hub_off_sleep
-        else:
-            result["actions"].append(f"Power-cycling SDRplay port directly (hub {hub} port {port})")
-            off_sleep = args.off_sleep
-
-        dbg(f"POWER OFF hub {hub} port {port} (mode={mode})")
-        ok, msg = uhubctl_power(hub, port, "off", timeout=20)
-        result["actions"].append(f"hub {hub} port {port} off: {msg}")
-        if not ok:
-            result["summary"] = f"Failed power off hub {hub} port {port}"
-            record_state(result, ok=False, last_action=result["summary"])
-            emit(result, args.json_output)
-            return 6
-
-        sleep_dbg(off_sleep, "port off settle")
-
-        rc_uh, uh_out, uh_err = run_cmd(privileged_cmd("uhubctl"), timeout=30)
-        if rc_uh != 0:
-            result["summary"] = f"uhubctl failed before power ON: {uh_err.strip() or uh_out.strip()}"
-            record_state(result, ok=False, last_action=result["summary"])
-            emit(result, args.json_output)
-            return 7
-
-        t2, match_msg = match_target_for_power_on(d, uh_out)
-        result["actions"].append(f"Power ON target: {match_msg}")
-
-        dbg(f"POWER ON hub {t2['hub']} port {t2['port']}")
-        ok, msg = uhubctl_power(t2["hub"], t2["port"], "on", timeout=20)
-        result["actions"].append(f"hub {t2['hub']} port {t2['port']} on: {msg}")
-        if not ok:
-            result["summary"] = f"Failed power on hub {t2['hub']} port {t2['port']}"
-            record_state(result, ok=False, last_action=result["summary"])
-            emit(result, args.json_output)
-            return 7
-
-        sleep_dbg(args.on_sleep, "port on settle")
-
-    result["powercycle_done"] = True
-
-    # Requested start sequence after reset:
-    # sleep 10 -> start sdrplay -> sleep 5 -> start kismet -> sleep 5 -> start sniffle -> sleep 5
-    dbg("----- POST-RESET: restart services -----")
-    result["actions"].append("Post-reset sequence: sleep 10s before restarting services")
-    sleep_dbg(10, "pre-start settle after USB reset")
-    ok, msg = systemctl("start", args.sdrplay_service)
-    dbg(f"start sdrplay ok={ok}: {msg}")
-    result["actions"].append(msg)
-    sleep_dbg(5, "let sdrplay API come up before kismet")
-    ok, msg = start_kismet(args.kismet_service, result["actions"])
-    dbg(f"start kismet ok={ok}: {msg}")
-    result["actions"].append(msg)
-
-    kismet_ok, rtl_count, health_detail = health_check_kismet(
-        args.kismet_service, expect_rtl433, args.health_check_sleep
-    )
-    dbg(f"Post-reset health: kismet_ok={kismet_ok} rtl_433={rtl_count}/{expect_rtl433}")
-    result["actions"].append(f"Post-reset health check: {health_detail}")
-    if not (kismet_ok and rtl_count >= expect_rtl433):
-        diagnose_kismet_failure(args.kismet_service, result["actions"])
-        result["summary"] = (
-            f"Reset completed but health check failed: kismet_ok={kismet_ok}, "
-            f"rtl_433={rtl_count}/{expect_rtl433} ({sdr_count} SDR(s) via lsusb)"
-        )
-        record_state(result, ok=False, last_action=result["summary"])
-        emit(result, args.json_output)
-        return 10
-
-    wifi_ok, wifi_detail = ensure_wifi_capture(
-        args.kismet_service, result["actions"], args.health_check_sleep
-    )
-    result["actions"].append(f"Post-reset WiFi check: {wifi_detail}")
-    result["wifi_ok"] = bool(wifi_ok)
-    if wifi_ok:
-        kismet_ok2, rtl_count2, health2 = get_kismet_state_and_rtl433_count(
-            args.kismet_service
-        )
-        result["actions"].append(
-            f"Post-reset after WiFi ensure: {health2} (expected >= {expect_rtl433})"
-        )
-        if kismet_ok2:
-            rtl_count = rtl_count2
+    if result.get("wifi_restarted"):
+        parts.append(f"wifi={'OK' if wifi_ok else 'MISSING'} after kismet fix")
     else:
-        result["actions"].append(
-            "WiFi capture still missing after kismet restart (SDR health still OK)"
-        )
+        parts.append(f"wifi={'OK' if wifi_ok else 'MISSING'} (no wifi restart)")
 
-    # Optional SDR verification
-    if args.verify:
-        ok, vmsg = soapy_verify()
-        result["actions"].append(vmsg)
-        if not ok:
-            result["summary"] = vmsg
-            record_state(result, ok=False, last_action=vmsg)
-            emit(result, args.json_output)
-            return 8
+    parts.append(f"sniffle={'OK' if sniffle_ok else 'FAILED'}")
 
-    if any(d.get("mode") == "hub_fallback" for d in target):
-        uniq = sorted({d.get("downstream_hub") for d in target if d.get("downstream_hub")})
-        result["summary"] = (
-            f"Recovered after USB reset: kismet active and rtl_433 recovered ({rtl_count})"
-            f"; wifi={'OK' if wifi_ok else 'MISSING'}"
-            f". "
-            f"Power-cycled upstream port(s) for downstream hub(s) {', '.join(uniq)}"
-        )
-    else:
-        first = target[0]
-        result["summary"] = (
-            f"Recovered after USB reset: kismet active and rtl_433 recovered ({rtl_count})"
-            f"; wifi={'OK' if wifi_ok else 'MISSING'}"
-            f". "
-            f"Power-cycled SDRplay port(s), first target hub {first['hub']} port {first['port']}"
-        )
-
-    result["ok"] = True
-    record_state(result, ok=True, last_action=result["summary"])
+    result["ok"] = bool(tpms_ok)
+    result["summary"] = "; ".join(parts)
+    record_state(result, ok=result["ok"], last_action=result["summary"])
     emit(result, args.json_output)
-    return 0
+    return 0 if result["ok"] else 10
+
 
 if __name__ == "__main__":
     try:
